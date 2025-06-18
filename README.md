@@ -4,7 +4,7 @@ An intelligent medical AI system designed specifically for Type 2 diabetes patie
 
 ## 📋 Project Overview
 
-![Project Overview](./smarthealth_pdf2.pdf)
+![Project Overview](smarthealth_pdf2.pdf)
 
 *Click to view the detailed project architecture and feature overview*
 
