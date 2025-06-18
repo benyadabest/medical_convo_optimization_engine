@@ -1,0 +1,464 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any
+import openai
+import httpx
+import json
+import os
+from dotenv import load_dotenv
+from datetime import datetime
+import uuid
+
+# Load environment variables
+load_dotenv()
+
+app = FastAPI(title="Conversation Optimizer Engine", version="1.0.0")
+
+# CORS setup
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# API Keys
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
+
+if not OPENAI_API_KEY:
+    print("⚠️  WARNING: OPENAI_API_KEY not found in .env file")
+
+openai.api_key = OPENAI_API_KEY
+
+# Pydantic Models
+class MedicalQuery(BaseModel):
+    question: str
+    patient_context: Optional[Dict[str, Any]] = {}
+    conversation_history: Optional[List[Dict]] = []
+    include_sources: Optional[bool] = True
+
+class ResponseModification(BaseModel):
+    response_id: str
+    modification_type: str  # 'simplify', 'detail', 'personalize', 'practical'
+    patient_context: Optional[Dict[str, Any]] = {}
+
+class MedicalResponse(BaseModel):
+    id: str
+    content: str
+    sources: List[str]
+    confidence_level: str
+    follow_up_prompts: List[Dict[str, str]]
+    safety_notes: str
+    evidence_quality: str
+
+class ModifiedResponse(BaseModel):
+    id: str
+    content: str
+    modification_type: str
+    follow_up_prompts: List[Dict[str, str]]
+    modification_notes: str
+
+# OpenAI Function Schemas
+MEDICAL_RESPONSE_SCHEMA = {
+    "name": "generate_medical_response",
+    "description": "Generate comprehensive medical response with follow-up suggestions",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "medical_content": {
+                "type": "string",
+                "description": "Comprehensive medical information addressing the question"
+            },
+            "key_points": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Main medical points covered"
+            },
+            "confidence_level": {
+                "type": "string",
+                "enum": ["high", "moderate", "low"],
+                "description": "Confidence in the medical information provided"
+            },
+            "evidence_quality": {
+                "type": "string",
+                "enum": ["strong", "moderate", "limited", "insufficient"],
+                "description": "Quality of evidence for this medical information"
+            },
+            "safety_considerations": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Important safety notes or warnings"
+            },
+            "follow_up_suggestions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "category": {"type": "string"},
+                        "prompt": {"type": "string"},
+                        "rationale": {"type": "string"}
+                    }
+                },
+                "description": "5 intelligent follow-up conversation starters"
+            }
+        },
+        "required": ["medical_content", "confidence_level", "evidence_quality", "follow_up_suggestions"]
+    }
+}
+
+RESPONSE_MODIFICATION_SCHEMAS = {
+    "simplify": {
+        "name": "simplify_medical_response",
+        "description": "Rewrite medical information for easier understanding",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "simplified_content": {"type": "string", "description": "Medical info in simple language"},
+                "key_takeaways": {"type": "array", "items": {"type": "string"}},
+                "avoided_jargon": {"type": "array", "items": {"type": "string"}},
+                "follow_up_suggestions": {"type": "array", "items": {"type": "object"}}
+            },
+            "required": ["simplified_content", "follow_up_suggestions"]
+        }
+    },
+    "detail": {
+        "name": "expand_medical_response",
+        "description": "Provide more comprehensive medical information",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "detailed_content": {"type": "string", "description": "Expanded medical information"},
+                "additional_context": {"type": "array", "items": {"type": "string"}},
+                "technical_details": {"type": "array", "items": {"type": "string"}},
+                "follow_up_suggestions": {"type": "array", "items": {"type": "object"}}
+            },
+            "required": ["detailed_content", "follow_up_suggestions"]
+        }
+    },
+    "personalize": {
+        "name": "personalize_medical_response",
+        "description": "Adapt medical response to patient's specific context",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "personalized_content": {"type": "string", "description": "Patient-specific medical information"},
+                "relevance_factors": {"type": "array", "items": {"type": "string"}},
+                "personal_considerations": {"type": "array", "items": {"type": "string"}},
+                "follow_up_suggestions": {"type": "array", "items": {"type": "object"}}
+            },
+            "required": ["personalized_content", "follow_up_suggestions"]
+        }
+    }
+}
+
+# Perplexity Client for Medical Sourcing
+class PerplexityMedicalClient:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = "https://api.perplexity.ai"
+    
+    async def get_medical_sources(self, query: str, context: str = "") -> Optional[Dict]:
+        """Get medical sources and recent research for a query"""
+        if not self.api_key:
+            return None
+        
+        research_query = f"""
+        Medical query: {query}
+        {f"Patient context: {context}" if context else ""}
+        
+        Provide current medical information with proper citations from:
+        - Peer-reviewed medical journals
+        - Medical guidelines and protocols  
+        - Government health agencies
+        - Recent clinical research
+        
+        Focus on evidence-based information with specific citations.
+        """
+        
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": "llama-3.1-sonar-large-128k-online",
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": "You are a medical research assistant. Provide evidence-based medical information with proper citations."
+                            },
+                            {"role": "user", "content": research_query}
+                        ],
+                        "max_tokens": 1000,
+                        "temperature": 0.2
+                    }
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    return {
+                        "content": result["choices"][0]["message"]["content"],
+                        "sources": self._extract_sources(result["choices"][0]["message"]["content"])
+                    }
+        except Exception as e:
+            print(f"Perplexity error: {e}")
+            return None
+    
+    def _extract_sources(self, content: str) -> List[str]:
+        """Extract source citations from Perplexity response"""
+        # Simple source extraction - could be more sophisticated
+        sources = []
+        lines = content.split('\n')
+        for line in lines:
+            if any(indicator in line.lower() for indicator in ['source:', 'reference:', 'citation:', 'study:', 'journal:']):
+                sources.append(line.strip())
+        return sources[:5]  # Limit to top 5 sources
+
+# Initialize Perplexity client
+perplexity_client = PerplexityMedicalClient(PERPLEXITY_API_KEY)
+
+# Core Medical AI Engine
+class ConversationOptimizer:
+    def __init__(self):
+        self.client = openai
+        self.response_cache = {}  # Simple in-memory cache
+    
+    async def generate_medical_response(self, query: str, patient_context: Dict = None, conversation_history: List = None) -> Dict:
+        """Generate comprehensive medical response with sources and follow-ups"""
+        
+        # Get medical sources from Perplexity
+        source_data = None
+        if perplexity_client.api_key:
+            context_str = self._format_context(patient_context) if patient_context else ""
+            source_data = await perplexity_client.get_medical_sources(query, context_str)
+        
+        # Build context for OpenAI
+        context = self._build_medical_context(query, patient_context, conversation_history, source_data)
+        
+        try:
+            response = self.client.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": """You are a medical AI assistant providing evidence-based information. 
+                        
+                        Guidelines:
+                        - Provide comprehensive, accurate medical information
+                        - Include appropriate medical disclaimers
+                        - Generate 5 intelligent follow-up questions that guide valuable learning
+                        - Consider patient context when available
+                        - Assess confidence and evidence quality honestly
+                        - Never provide direct medical advice or treatment decisions"""
+                    },
+                    {"role": "user", "content": context}
+                ],
+                functions=[MEDICAL_RESPONSE_SCHEMA],
+                function_call={"name": "generate_medical_response"},
+                temperature=0.3,
+                max_tokens=2000
+            )
+            
+            function_response = response.choices[0].message.function_call.arguments
+            result = json.loads(function_response)
+            
+            # Add sources from Perplexity if available
+            sources = result.get("sources", [])
+            if source_data and source_data.get("sources"):
+                sources.extend(source_data["sources"])
+            
+            # Generate response ID
+            response_id = str(uuid.uuid4())
+            
+            # Cache the response
+            self.response_cache[response_id] = result
+            
+            return {
+                "id": response_id,
+                "content": result["medical_content"],
+                "sources": sources[:10],  # Limit to 10 sources
+                "confidence_level": result["confidence_level"],
+                "follow_up_prompts": result["follow_up_suggestions"],
+                "safety_notes": self._generate_safety_notes(result),
+                "evidence_quality": result["evidence_quality"]
+            }
+            
+        except Exception as e:
+            print(f"OpenAI error: {e}")
+            return self._fallback_response(query)
+    
+    async def modify_response(self, response_id: str, modification_type: str, patient_context: Dict = None) -> Dict:
+        """Modify an existing response based on user preferences"""
+        
+        if response_id not in self.response_cache:
+            raise HTTPException(status_code=404, detail="Response not found")
+        
+        original_response = self.response_cache[response_id]
+        schema = RESPONSE_MODIFICATION_SCHEMAS.get(modification_type)
+        
+        if not schema:
+            raise HTTPException(status_code=400, detail="Invalid modification type")
+        
+        # Build modification context
+        context = f"""
+        Original medical response: {original_response['medical_content']}
+        
+        Modification requested: {modification_type}
+        {f"Patient context: {self._format_context(patient_context)}" if patient_context else ""}
+        
+        Please modify the response according to the requested type while maintaining medical accuracy.
+        """
+        
+        try:
+            response = self.client.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": f"You are modifying medical information to be more {modification_type}. Maintain accuracy while adjusting the presentation style."
+                    },
+                    {"role": "user", "content": context}
+                ],
+                functions=[schema],
+                function_call={"name": schema["name"]},
+                temperature=0.3,
+                max_tokens=2000
+            )
+            
+            function_response = response.choices[0].message.function_call.arguments
+            result = json.loads(function_response)
+            
+            # Generate new response ID
+            new_response_id = str(uuid.uuid4())
+            
+            # Cache the modified response
+            self.response_cache[new_response_id] = result
+            
+            # Extract content based on modification type
+            content_key = f"{modification_type}_content" if modification_type != "personalize" else "personalized_content"
+            
+            return {
+                "id": new_response_id,
+                "content": result[content_key],
+                "modification_type": modification_type,
+                "follow_up_prompts": result["follow_up_suggestions"],
+                "modification_notes": f"Response has been {modification_type}d based on your preferences."
+            }
+            
+        except Exception as e:
+            print(f"Modification error: {e}")
+            raise HTTPException(status_code=500, detail=f"Error modifying response: {str(e)}")
+    
+    def _build_medical_context(self, query: str, patient_context: Dict, conversation_history: List, source_data: Dict) -> str:
+        """Build comprehensive context for medical AI"""
+        context_parts = [f"Medical Question: {query}"]
+        
+        if patient_context:
+            context_parts.append(f"Patient Context: {self._format_context(patient_context)}")
+        
+        if conversation_history:
+            context_parts.append("Previous Conversation:")
+            for msg in conversation_history[-3:]:  # Last 3 messages for context
+                role = msg.get("role", "unknown")
+                content = msg.get("content", "")
+                context_parts.append(f"{role}: {content}")
+        
+        if source_data and source_data.get("content"):
+            context_parts.append(f"Recent Research Context: {source_data['content'][:1000]}")
+        
+        return "\n\n".join(context_parts)
+    
+    def _format_context(self, context: Dict) -> str:
+        """Format patient context for AI consumption"""
+        if not context:
+            return ""
+        
+        formatted = []
+        for key, value in context.items():
+            if value:
+                formatted.append(f"{key}: {value}")
+        
+        return ", ".join(formatted)
+    
+    def _generate_safety_notes(self, result: Dict) -> str:
+        """Generate appropriate safety disclaimers"""
+        base_disclaimer = "This information is for educational purposes only and should not replace professional medical advice."
+        
+        safety_considerations = result.get("safety_considerations", [])
+        if safety_considerations:
+            safety_text = " Important considerations: " + "; ".join(safety_considerations)
+            return base_disclaimer + safety_text
+        
+        return base_disclaimer
+    
+    def _fallback_response(self, query: str) -> Dict:
+        """Provide fallback response when AI services fail"""
+        return {
+            "id": str(uuid.uuid4()),
+            "content": f"I apologize, but I'm currently unable to provide a detailed response about '{query}'. Please try again later or consult with a healthcare professional for medical questions.",
+            "sources": ["System fallback response"],
+            "confidence_level": "low",
+            "follow_up_prompts": [
+                {"category": "general", "prompt": "Can you try rephrasing your question?", "rationale": "Alternative phrasing might help"}
+            ],
+            "safety_notes": "Please consult with a healthcare professional for medical advice.",
+            "evidence_quality": "insufficient"
+        }
+
+# Initialize the conversation optimizer
+optimizer = ConversationOptimizer()
+
+# API Endpoints
+@app.get("/")
+async def root():
+    return {
+        "message": "🚀 Conversation Optimizer Engine",
+        "features": ["Medical AI", "Response Modification", "Source Integration"],
+        "status": "active"
+    }
+
+@app.post("/api/medical/ask", response_model=MedicalResponse)
+async def ask_medical_question(request: MedicalQuery):
+    """Ask a medical question and get comprehensive response with follow-ups"""
+    try:
+        response = await optimizer.generate_medical_response(
+            query=request.question,
+            patient_context=request.patient_context,
+            conversation_history=request.conversation_history
+        )
+        return MedicalResponse(**response)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating response: {str(e)}")
+
+@app.post("/api/medical/modify", response_model=ModifiedResponse)
+async def modify_response(request: ResponseModification):
+    """Modify an existing response (simplify, detail, personalize, etc.)"""
+    try:
+        response = await optimizer.modify_response(
+            response_id=request.response_id,
+            modification_type=request.modification_type,
+            patient_context=request.patient_context
+        )
+        return ModifiedResponse(**response)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error modifying response: {str(e)}")
+
+@app.get("/api/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "openai_configured": bool(OPENAI_API_KEY),
+        "perplexity_configured": bool(PERPLEXITY_API_KEY)
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    print("🚀 Starting Conversation Optimizer Engine")
+    print("🔧 Features: Medical AI, Response Modification, Source Integration")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
