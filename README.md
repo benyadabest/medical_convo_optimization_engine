@@ -2,11 +2,11 @@
 
 An intelligent medical AI system designed specifically for Type 2 diabetes patients, providing evidence-based information, personalized treatment guidance, and comprehensive diabetes management support.
 
-## 📋 Project Overview
+## 📱 Live Interface Preview
 
-![Project Overview](./smarthealth_pdf2.pdf)
+![Smart Medical Conversation Engine Interface](./smarthealth_visual.png)
 
-*Click to view the detailed project architecture and feature overview*
+*Interactive diabetes management interface with AI-powered treatment recommendations and priority filtering*
 
 ## 🌟 Features
 
